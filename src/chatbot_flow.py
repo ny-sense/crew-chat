@@ -22,6 +22,15 @@ ALLOWED_KEYS = [
     "looking_for",
 ]
 
+SYSTEM_PROMPT_USER_INTENT = """Detect if user's utterance is a frequently asked question. At each user turn,
+classify the user’s message into exactly one of:
+ 
+ • intent_faq                  (they’re asking a frequently‑asked question)
+ • intent_file_upload          (they want to upload a file)  
+ • fallback                    (anything else) 
+
+If you choose intent_faq, do _not_ ask for more data—you’ll handle it separately."""
+
 SYSTEM_PROMPT = """
 Execute these step by step.
 Step 1. Prompt: `Hello! I'm a virtual recruiting assistant with Phillips Staffing. I'd love to help you out! Are you looking for job opportunities, or are you looking for talent`
@@ -150,26 +159,81 @@ class ChatbotFlow(Flow[ChatState]):
 
     @router(receive)
     def classify_intent(self, state: ChatState) -> str:
-        last_msg = state.history[-1]["content"]
-        # simple LLM‑based intent classifier (could be your own model)
+
+        # grab the last assistant turn (or empty if there isn’t one)
+        last_assistant_msg = next(
+            (m["content"] for m in reversed(state.history) if m["role"] == "assistant"),
+            ""
+        )
+
+        last_user_msg = state.history[-1]["content"]
+
+        # few‑shot examples to help the LLM
+        examples = [
+            ("How do I know I got the job?", "intent_faq"),
+            ("What positions do you have?", "intent_faq"),
+            ("Any work from home positions?", "intent_faq"),
+            ("I want to see my paycheck stub", "intent_faq"),
+            ("Do you have a Sales position open for 23227 Richmond va", "intent_faq"),
+            ("Is this a remote , hybrid or onsite role ", "intent_faq"),
+            ("I want to upload my resume", "intent_file_upload")
+        ]
+        # build our little classification prompt
+        prompt = f"""
+            You are a router that decides whether the *user’s latest message* is:
+              • A reply to the *previous assistant question*, or
+              • A brand-new FAQ request.
+            
+            Here’s the last assistant question:
+            \"\"\"{last_assistant_msg}\"\"\"
+            
+            And here’s the user’s reply:
+            \"\"\"{last_user_msg}\"\"\"
+            
+            Classify this into exactly one of:
+              • intent_answer — meaning “this answers my previous question”
+              • intent_faq — meaning “this is a brand-new FAQ”
+              • intent_schedule_interview
+              • intent_get_job_match_info
+            
+            Respond with exactly the label.
+            """
+        for msg, label in examples:
+            prompt += f"User: \"{msg}\"\nLabel: {label}\n\n"
+        prompt += f"User: \"{last_user_msg}\"\nLabel:"
+
         resp = completion(
             model=self.model,
-            messages=[
-                {"role": "system", "content":
-                    "Classify the user’s message into exactly one of: "
-                    "fallback or fallback."
-                    "Respond with *only* the token (no extra text)."
-                 },
-                {"role": "user", "content": last_msg}
-            ]
+            messages=[{"role": "user", "content": prompt}]
         )
         intent = resp["choices"][0]["message"]["content"].strip()
         print(f"detected intent- {intent}")
-        if intent == "intent_schedule_interview":
-            return "intent_schedule_interview"
-        if intent == "intent_get_job_match_info":
-            return "intent_get_job_match_info"
-        return "fallback"  # anything else goes here
+        if intent in ("intent_schedule_interview", "intent_get_job_match_info", "intent_faq"):
+            return intent
+        else:
+            return "fallback"  # anything else goes here
+
+    @listen("intent_faq")
+    def handle_faq(self, state: ChatState) -> str:
+        # Here you can either embed a small FAQ lookup,
+        # hit an external FAQ‐tool, or just ask the LLM to answer:
+
+        last_user_msg = state.history[-1]["content"]
+
+        resp = completion(
+            model=self.model,
+            messages=state.history + [
+                {"role": "system", "content":
+                    f"Answer the following question as a Phillips Staffing FAQ.  "
+                    f""
+                    f"{last_user_msg}"
+                    f"Be concise, 1–2 sentences."}
+            ]
+        )
+        answer = resp["choices"][0]["message"]["content"]
+        state.history.append({"role": "assistant", "content": answer})
+        print(f"faq answer: {answer}")
+        return answer
 
     @listen("intent_schedule_interview")
     def handoff_to_scheduler(self, state: ChatState) -> str:

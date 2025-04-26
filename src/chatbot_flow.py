@@ -1,6 +1,7 @@
 # src/chatbot_flow.py
 import json
 import re
+import asyncio
 
 from crewai.flow.flow import Flow, start, listen, router
 from pydantic import BaseModel
@@ -8,13 +9,17 @@ from litellm import completion
 from src.tools.scheduler_tool import schedule_interview
 
 from src.scheduler_crew import SchedulerCrew
+from src.tools.write_tool import write_field
 
 TOOLS = {
     "schedule_interview": schedule_interview,
     # "send_email":         send_email,
+    "write_field": write_field,
 }
 
 ALLOWED_KEYS = [
+    "first_name",
+    "last_name",
     "full_name",
     "email",
     "phone",
@@ -103,7 +108,7 @@ class ChatbotFlow(Flow[ChatState]):
         return self.state
 
     @listen(receive)
-    def extract_info(self, state: ChatState) -> None:
+    async def extract_info(self, state: ChatState) -> None:
         # only extract when the turn before last was the bot asking something
         if len(state.history) < 2 or state.history[-2]["role"] != "assistant":
             return None
@@ -130,10 +135,15 @@ class ChatbotFlow(Flow[ChatState]):
         )
 
         # only an user‐role message
-        resp = completion(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+        resp = await asyncio.to_thread(
+            completion,
+            self.model,
+            [{"role": "user", "content": prompt}],
         )
+        # resp = completion(
+        #     model=self.model,
+        #     messages=[{"role": "user", "content": prompt}],
+        # )
 
         raw = resp["choices"][0]["message"]["content"].strip()
         # be permissive about backticks or code fences
@@ -151,11 +161,30 @@ class ChatbotFlow(Flow[ChatState]):
         # If none of the keys were allowed, do nothing
         if not filtered:
             return None
+        for field, val in filtered.items():
+            # merge whatever got extracted
+            state.context[field] = val
 
-        # merge whatever got extracted
-        state.context.update(data)
+            # Call the write_field tool
+            # out = TOOLS["write_field"].run( field, val)
+            out = asyncio.create_task(
+                self._run_write_tool(field, val, state)
+            )
+            print(f"{out}")
+
         print(f"state.context = {state.context}")
         return None
+
+    async def _run_write_tool(self, field: str, value: str, state: ChatState):
+        """
+        Call write_field tool asynchronously.
+        """
+        result = write_field.run(field,value)
+        # if it returns a coroutine, await it
+        if asyncio.iscoroutine(result):
+            result = await result
+        print(result)
+        return result
 
     @router(receive)
     def classify_intent(self, state: ChatState) -> str:
@@ -208,7 +237,7 @@ class ChatbotFlow(Flow[ChatState]):
         )
         intent = resp["choices"][0]["message"]["content"].strip()
         print(f"detected intent- {intent}")
-        if intent in ("intent_schedule_interview", "intent_get_job_match_info", "intent_faq"):
+        if intent == "intent_faq":
             return intent
         else:
             return "fallback"  # anything else goes here
@@ -292,7 +321,7 @@ class ChatbotFlow(Flow[ChatState]):
 
     @listen(reply)
     def detect_intent(self, last_reply: str) -> str:
-        # placeholder for your future intent logic:
+        # placeholder for future intent logic:
         #    intent = classify(last_user_message, self.state.history)
         #    if intent == "some_action": ...
         #

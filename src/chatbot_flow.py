@@ -10,6 +10,7 @@ from src.tools.scheduler_tool import schedule_interview
 
 from src.scheduler_crew import SchedulerCrew
 from src.tools.write_tool import write_field
+from src.decorator import timeit_listener
 
 TOOLS = {
     "schedule_interview": schedule_interview,
@@ -108,6 +109,7 @@ class ChatbotFlow(Flow[ChatState]):
         return self.state
 
     @listen(receive)
+    @timeit_listener
     async def extract_info(self, state: ChatState) -> None:
         # only extract when the turn before last was the bot asking something
         if len(state.history) < 2 or state.history[-2]["role"] != "assistant":
@@ -116,44 +118,66 @@ class ChatbotFlow(Flow[ChatState]):
         question = state.history[-2]["content"]
         answer = state.history[-1]["content"]
 
+        print(f"question: {question}")
+        print(f"answer: {answer}")
+
         # build the bullet list from ALLOWED_KEYS
         bullets = "\n".join(f"• {k}" for k in ALLOWED_KEYS)
 
         system_prompt = f"""
-        I will give you a bot question and the user's answer.
-        When you output JSON, use *only* these keys (spelled exactly):
+        You’re a JSON extractor.  You will be given:
 
+          1) A **Question** (so you know what data to look for)  
+          2) A **User’s Answer** (the only place you should pull all values from)  
+
+        **INSTRUCTIONS**  
+        - **Only** pull values that actually appear in the Answer text.
+        - Extract **all** fields related to the Answer text.
+        - Do *not* include any explanatory text.  
+        - Do *not* wrap your JSON in markdown fences (```), code blocks, or quotes.  
+        - Do *not* add any keys other than the allowed ones.  
+        - Do *not* add any whitespace or punctuation before or after the JSON.  
+        - Do *not* extract any values from the Question itself—use it only to understand which fields to look for.  
+
+        Allowed keys (exact spelling):
         {bullets}
 
-        Respond with a single JSON object mapping each found key to its value.
+        Return ** a JSON object ** mapping each found key to its value.  
+        If you find none, return {{}}.
         """
 
-        # ask the LLM in a single user turn (Anthropic‑compatible)
-        prompt = (
-            f"{system_prompt}\n\nBot asked:\n{question}\n\n"
-            f"User replied:\n{answer}"
-        )
+        #print(system_prompt)
 
-        # only an user‐role message
-        resp = await asyncio.to_thread(
-            completion,
-            self.model,
-            [{"role": "user", "content": prompt}],
-        )
+        prompt_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content":
+                f"Question:\n{question}\n\n"
+                f"Answer:\n{answer}"
+             }
+        ]
+
+        # a single blocking call here; we can offload to a thread
+        resp = completion(model=self.model, messages=prompt_messages)
+
+        print(f"resp: {resp}")
         # resp = completion(
         #     model=self.model,
         #     messages=[{"role": "user", "content": prompt}],
         # )
 
         raw = resp["choices"][0]["message"]["content"].strip()
+        print(f"raw: {raw}")
+
         # be permissive about backticks or code fences
         raw = re.sub(r"^```json|```$", "", raw, flags=re.I).strip()
-
+        print(f"raw: {raw}")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             # if parsing fails, just skip
             return None
+
+        print(f"extracted json: {data}")
 
         # Keep only allowed keys
         filtered = {k: v for k, v in data.items() if k in ALLOWED_KEYS}
@@ -161,6 +185,7 @@ class ChatbotFlow(Flow[ChatState]):
         # If none of the keys were allowed, do nothing
         if not filtered:
             return None
+        print(f"filtered items: {filtered}")
         for field, val in filtered.items():
             # merge whatever got extracted
             state.context[field] = val
@@ -187,6 +212,7 @@ class ChatbotFlow(Flow[ChatState]):
         return result
 
     @router(receive)
+    @timeit_listener
     def classify_intent(self, state: ChatState) -> str:
 
         # grab the last assistant turn (or empty if there isn’t one)
@@ -226,6 +252,7 @@ class ChatbotFlow(Flow[ChatState]):
               • intent_get_job_match_info
             
             Respond with exactly the label.
+            **Greeting messages e.g. Hello, Hola are not FAQS**
             """
         for msg, label in examples:
             prompt += f"User: \"{msg}\"\nLabel: {label}\n\n"
@@ -243,6 +270,7 @@ class ChatbotFlow(Flow[ChatState]):
             return "fallback"  # anything else goes here
 
     @listen("intent_faq")
+    @timeit_listener
     def handle_faq(self, state: ChatState) -> str:
         # Here you can either embed a small FAQ lookup,
         # hit an external FAQ‐tool, or just ask the LLM to answer:
@@ -265,6 +293,7 @@ class ChatbotFlow(Flow[ChatState]):
         return answer
 
     @listen("intent_schedule_interview")
+    @timeit_listener
     def handoff_to_scheduler(self, state: ChatState) -> str:
         # instantiate & kickoff your SchedulerCrew
         scheduler = SchedulerCrew().crew()
@@ -287,6 +316,7 @@ class ChatbotFlow(Flow[ChatState]):
         )
 
     @listen("fallback")
+    @timeit_listener
     def reply(self, state: ChatState) -> str:
         # if no special intent, fall back to your original LLM reply
         resp = completion(model=self.model, messages=state.history)
@@ -320,6 +350,7 @@ class ChatbotFlow(Flow[ChatState]):
         return text
 
     @listen(reply)
+    @timeit_listener
     def detect_intent(self, last_reply: str) -> str:
         # placeholder for future intent logic:
         #    intent = classify(last_user_message, self.state.history)

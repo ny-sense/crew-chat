@@ -16,6 +16,8 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
+    #--- pass replacements dict here ---
+    flow.state.context = {"job_role": "forklift operator"}
     st= time.time_ns()/ 1000000
     reply = flow.kickoff(inputs={"message": req.message})
     et = time.time_ns() / 1000000
